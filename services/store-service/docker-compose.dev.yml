@@ -1,0 +1,30 @@
+version: '3.8'
+services:
+  store-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3004:3004"
+    environment:
+      - PORT=3004
+      - MONGO_URI=mongodb://mongo:27017/fuudie-store
+      - JWT_SECRET=${JWT_SECRET}
+      - NODE_ENV=development
+    volumes:
+      - .:/app
+      - /app/node_modules
+    depends_on:
+      - mongo
+    command: npm run dev
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+volumes:
+  mongo_data:

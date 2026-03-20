@@ -1,0 +1,26 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Add the following block inside the `services:` section of your root
+# docker-compose.dev.yml  (alongside api-gateway, user-service, etc.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+  store-service:
+    build:
+      context: ./store-service
+      dockerfile: Dockerfile
+    container_name: fuudie-store-service-dev
+    restart: unless-stopped
+    ports:
+      - "3004:3004"
+    environment:
+      - PORT=3004
+      - MONGO_URI=mongodb://mongo:27017/fuudie-store
+      - JWT_SECRET=${JWT_SECRET}
+      - NODE_ENV=development
+    volumes:
+      - ./store-service:/app          # live reload via nodemon
+      - /app/node_modules
+    depends_on:
+      - mongo
+    networks:
+      - fuudie-network
+    command: npm run dev

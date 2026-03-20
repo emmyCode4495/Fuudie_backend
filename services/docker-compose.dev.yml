@@ -1,0 +1,390 @@
+# version: '3.8'
+
+# services:
+
+#   mongodb:
+#     image: mongo:7
+#     container_name: wolt-mongodb
+#     restart: unless-stopped
+#     ports:
+#       - "27017:27017"
+#     environment:
+#       MONGO_INITDB_ROOT_USERNAME: admin
+#       MONGO_INITDB_ROOT_PASSWORD: admin123
+#     volumes:
+#       - mongodb_data:/data/db
+#       - mongodb_config:/data/configdb
+#     networks:
+#       - wolt-network
+#     healthcheck:
+#       test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+#       interval: 10s
+#       timeout: 5s
+#       retries: 5
+
+#   mongo-express:
+#     image: mongo-express:latest
+#     container_name: wolt-mongo-express
+#     restart: unless-stopped
+#     ports:
+#       - "8083:8083"
+#     environment:
+#       ME_CONFIG_MONGODB_ADMINUSERNAME: admin
+#       ME_CONFIG_MONGODB_ADMINPASSWORD: admin123
+#       ME_CONFIG_MONGODB_URL: mongodb://admin:admin123@mongodb:27017/
+#       ME_CONFIG_BASICAUTH_USERNAME: admin
+#       ME_CONFIG_BASICAUTH_PASSWORD: admin
+#     depends_on:
+#       - mongodb
+#     networks:
+#       - wolt-network
+
+#   user-service:
+#     build:
+#       context: ./user-service
+#       dockerfile: Dockerfile
+#     container_name: wolt-user-service
+#     restart: unless-stopped
+#     ports:
+#       - "3001:3001"
+#     environment:
+#       - NODE_ENV=development
+#       - PORT=3001
+#       - MONGO_URI=mongodb://admin:admin123@mongodb:27017/wolt-user-service?authSource=admin
+#       - JWT_SECRET=local-dev-jwt-secret-key
+#       - JWT_REFRESH_SECRET=local-dev-refresh-secret-key
+#       - JWT_EXPIRES_IN=7d
+#       - JWT_REFRESH_EXPIRES_IN=30d
+#       - CORS_ORIGIN=*
+#     depends_on:
+#       mongodb:
+#         condition: service_healthy
+#     volumes:
+#       - ./user-service/src:/app/src
+#     networks:
+#       - wolt-network
+#     command: npm run dev
+
+#   restaurant-service:
+#     build:
+#       context: ./restaurant-service
+#       dockerfile: Dockerfile
+#     container_name: wolt-restaurant-service
+#     restart: unless-stopped
+#     ports:
+#       - "3002:3002"
+#     environment:
+#       - NODE_ENV=development
+#       - PORT=3002
+#       - MONGO_URI=mongodb://admin:admin123@mongodb:27017/wolt-restaurant-service?authSource=admin
+#       - JWT_SECRET=local-dev-jwt-secret-key
+#       - JWT_REFRESH_SECRET=local-dev-refresh-secret-key
+#       - JWT_EXPIRES_IN=7d
+#       - JWT_REFRESH_EXPIRES_IN=30d
+#       - CORS_ORIGIN=*
+#     depends_on:
+#       mongodb:
+#         condition: service_healthy
+#     volumes:
+#       - ./restaurant-service/src:/app/src
+#     networks:
+#       - wolt-network
+#     command: npm run dev
+
+#   order-service:
+#     build:
+#       context: ./order-service
+#       dockerfile: Dockerfile
+#     container_name: wolt-order-service
+#     restart: unless-stopped
+#     ports:
+#       - "3003:3003"
+#     environment:
+#       - NODE_ENV=development
+#       - PORT=3003
+#       - MONGO_URI=mongodb://admin:admin123@mongodb:27017/wolt-order-service?authSource=admin
+#       - JWT_SECRET=local-dev-jwt-secret-key
+#       - JWT_REFRESH_SECRET=local-dev-refresh-secret-key
+#       - JWT_EXPIRES_IN=7d
+#       - JWT_REFRESH_EXPIRES_IN=30d
+#       - CORS_ORIGIN=*
+#       - USER_SERVICE_URL=http://user-service:3001
+#       - RESTAURANT_SERVICE_URL=http://restaurant-service:3002
+#     depends_on:
+#       mongodb:
+#         condition: service_healthy
+#       user-service:
+#         condition: service_started
+#       restaurant-service:
+#         condition: service_started
+#     volumes:
+#       - ./order-service/src:/app/src
+#     networks:
+#       - wolt-network
+#     command: npm run dev
+
+#   api-gateway:
+#     build:
+#       context: ./api-gateway
+#       dockerfile: Dockerfile
+#     container_name: wolt-api-gateway
+#     restart: unless-stopped
+#     ports:
+#       - "3000:3000"
+#     environment:
+#       - NODE_ENV=development
+#       - PORT=3000
+#       - JWT_SECRET=local-dev-jwt-secret-key
+#       - JWT_REFRESH_SECRET=local-dev-refresh-secret-key
+#       - USER_SERVICE_URL=http://user-service:3001
+#       - RESTAURANT_SERVICE_URL=http://restaurant-service:3002
+#       - ORDER_SERVICE_URL=http://order-service:3003
+#       - CORS_ORIGIN=*
+#     depends_on:
+#       - user-service
+#       - restaurant-service
+#       - order-service
+#     volumes:
+#       - ./api-gateway/src:/app/src
+#     networks:
+#       - wolt-network
+#     command: npm run dev
+
+# volumes:
+#   mongodb_data:
+#     driver: local
+#   mongodb_config:
+#     driver: local
+
+# networks:
+#   wolt-network:
+#     driver: bridge
+
+version: '3.8'
+
+services:
+
+  mongodb:
+    image: mongo:7
+    container_name: wolt-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+    networks:
+      - wolt-network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongo-express:
+    image: mongo-express:latest
+    container_name: wolt-mongo-express
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: admin
+      ME_CONFIG_MONGODB_ADMINPASSWORD: admin123
+      ME_CONFIG_MONGODB_URL: mongodb://admin:admin123@mongodb:27017/
+      ME_CONFIG_BASICAUTH_USERNAME: admin
+      ME_CONFIG_BASICAUTH_PASSWORD: admin
+    depends_on:
+      - mongodb
+    networks:
+      - wolt-network
+
+  user-service:
+    build:
+      context: ./user-service
+      dockerfile: Dockerfile
+    container_name: wolt-user-service
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=development
+      - PORT=3001
+      - MONGO_URI=mongodb://admin:admin123@mongodb:27017/wolt-user-service?authSource=admin
+      - JWT_SECRET=local-dev-jwt-secret-key
+      - JWT_REFRESH_SECRET=local-dev-refresh-secret-key
+      - JWT_EXPIRES_IN=7d
+      - JWT_REFRESH_EXPIRES_IN=30d
+      - CORS_ORIGIN=*
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    volumes:
+      - ./user-service/src:/app/src
+    networks:
+      - wolt-network
+    command: npm run dev
+
+  restaurant-service:
+    build:
+      context: ./restaurant-service
+      dockerfile: Dockerfile
+    container_name: wolt-restaurant-service
+    restart: unless-stopped
+    ports:
+      - "3002:3002"
+    environment:
+      - NODE_ENV=development
+      - PORT=3002
+      - MONGO_URI=mongodb://admin:admin123@mongodb:27017/wolt-restaurant-service?authSource=admin
+      - JWT_SECRET=local-dev-jwt-secret-key
+      - JWT_REFRESH_SECRET=local-dev-refresh-secret-key
+      - JWT_EXPIRES_IN=7d
+      - JWT_REFRESH_EXPIRES_IN=30d
+      - CORS_ORIGIN=*
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    volumes:
+      - ./restaurant-service/src:/app/src
+    networks:
+      - wolt-network
+    command: npm run dev
+
+  order-service:
+    build:
+      context: ./order-service
+      dockerfile: Dockerfile
+    container_name: wolt-order-service
+    restart: unless-stopped
+    ports:
+      - "3003:3003"
+    environment:
+      - NODE_ENV=development
+      - PORT=3003
+      - MONGO_URI=mongodb://admin:admin123@mongodb:27017/wolt-order-service?authSource=admin
+      - JWT_SECRET=local-dev-jwt-secret-key
+      - JWT_REFRESH_SECRET=local-dev-refresh-secret-key
+      - JWT_EXPIRES_IN=7d
+      - JWT_REFRESH_EXPIRES_IN=30d
+      - CORS_ORIGIN=*
+      - USER_SERVICE_URL=http://user-service:3001
+      - RESTAURANT_SERVICE_URL=http://restaurant-service:3002
+      - STORE_SERVICE_URL=http://store-service:3004
+      - CATALOG_SERVICE_URL=http://catalog-service:3005
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      user-service:
+        condition: service_started
+      restaurant-service:
+        condition: service_started
+      store-service:
+        condition: service_started
+      catalog-service:
+        condition: service_started
+    volumes:
+      - ./order-service/src:/app/src
+    networks:
+      - wolt-network
+    command: npm run dev
+
+  store-service:
+    build:
+      context: ./store-service
+      dockerfile: Dockerfile
+    container_name: wolt-store-service
+    restart: unless-stopped
+    ports:
+      - "3004:3004"
+    environment:
+      - NODE_ENV=development
+      - PORT=3004
+      - MONGO_URI=mongodb://admin:admin123@mongodb:27017/wolt-store-service?authSource=admin
+      - JWT_SECRET=local-dev-jwt-secret-key
+      - JWT_REFRESH_SECRET=local-dev-refresh-secret-key
+      - JWT_EXPIRES_IN=7d
+      - JWT_REFRESH_EXPIRES_IN=30d
+      - CORS_ORIGIN=*
+      - USER_SERVICE_URL=http://user-service:3001
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    volumes:
+      - ./store-service/src:/app/src
+    networks:
+      - wolt-network
+    command: npm run dev
+
+  catalog-service:
+    build:
+      context: ./catalog-service
+      dockerfile: Dockerfile
+    container_name: wolt-catalog-service
+    restart: unless-stopped
+    ports:
+      - "3005:3005"
+    environment:
+      - NODE_ENV=development
+      - PORT=3005
+      - MONGO_URI=mongodb://admin:admin123@mongodb:27017/wolt-catalog-service?authSource=admin
+      - JWT_SECRET=local-dev-jwt-secret-key
+      - JWT_REFRESH_SECRET=local-dev-refresh-secret-key
+      - JWT_EXPIRES_IN=7d
+      - JWT_REFRESH_EXPIRES_IN=30d
+      - CORS_ORIGIN=*
+      - USER_SERVICE_URL=http://user-service:3001
+      - STORE_SERVICE_URL=http://store-service:3004
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      store-service:
+        condition: service_started
+    volumes:
+      - ./catalog-service/src:/app/src
+    networks:
+      - wolt-network
+    command: npm run dev
+
+  api-gateway:
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    container_name: wolt-api-gateway
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - JWT_SECRET=local-dev-jwt-secret-key
+      - JWT_REFRESH_SECRET=local-dev-refresh-secret-key
+      - USER_SERVICE_URL=http://user-service:3001
+      - RESTAURANT_SERVICE_URL=http://restaurant-service:3002
+      - ORDER_SERVICE_URL=http://order-service:3003
+      - STORE_SERVICE_URL=http://store-service:3004
+      - CATALOG_SERVICE_URL=http://catalog-service:3005
+      - CORS_ORIGIN=*
+    depends_on:
+      - user-service
+      - restaurant-service
+      - order-service
+      - store-service
+      - catalog-service
+    volumes:
+      - ./api-gateway/src:/app/src
+    networks:
+      - wolt-network
+    command: npm run dev
+
+volumes:
+  mongodb_data:
+    driver: local
+  mongodb_config:
+    driver: local
+
+networks:
+  wolt-network:
+    driver: bridge
