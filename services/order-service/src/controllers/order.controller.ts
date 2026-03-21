@@ -63,10 +63,10 @@ const validateFoodItems = async (
   // If restaurant-service is unavailable, trust client prices but flag it
   // In production you would always require server-side validation
   if (!menuRes?.data?.success) {
-    console.warn(
-      `[order-service] Could not validate menu items against restaurant-service for restaurantId=${restaurantId}. Trusting client prices.`
+    throw new AppError(
+      'Could not reach restaurant service to validate menu items. Please try again.',
+      503
     );
-    return buildItemsFromClient(items, ItemSource.RESTAURANT_SERVICE);
   }
 
   const menuItems: Record<string, any> = {};
@@ -76,8 +76,11 @@ const validateFoodItems = async (
   const processedItems: IOrderItem[] = items.map((item: any) => {
     const menuItem = menuItems[item.itemId];
 
-    // Fall back to client price if item not found in menu response
-    const basePrice = menuItem?.price ?? item.price;
+    // If item not found in menu, reject the order — don't trust client price
+    if (!menuItem) {
+      throw new AppError(`Menu item "${item.itemId}" not found in this restaurant's menu`, 422);
+    }
+    const basePrice = menuItem.price;
 
     let itemTotal = basePrice * item.quantity;
 
@@ -98,7 +101,7 @@ const validateFoodItems = async (
     return {
       itemId:     item.itemId,
       itemSource: ItemSource.RESTAURANT_SERVICE,
-      name:       menuItem?.name ?? item.name,
+      name:       menuItem.name,
       price:      basePrice,
       quantity:   item.quantity,
       variant:    item.variant,
@@ -127,10 +130,10 @@ const validateCatalogItems = async (
     .catch(() => null);
 
   if (!productsRes?.data?.success) {
-    console.warn(
-      `[order-service] Could not validate products against catalog-service for storeId=${storeId}. Trusting client prices.`
+    throw new AppError(
+      'Could not reach catalog service to validate products. Please try again.',
+      503
     );
-    return buildItemsFromClient(items, ItemSource.CATALOG_SERVICE);
   }
 
   const productMap: Record<string, any> = {};
@@ -142,30 +145,34 @@ const validateCatalogItems = async (
   for (const item of items) {
     const product = productMap[item.itemId];
 
-    if (product) {
-      // Stock check
-      if (!product.inStock) {
-        throw new AppError(`"${product.name}" is currently out of stock`, 422);
-      }
-      if (product.stockCount !== -1 && product.stockCount < item.quantity) {
-        throw new AppError(
-          `Only ${product.stockCount} unit(s) of "${product.name}" available`,
-          422
-        );
-      }
+    // Reject unknown product IDs — never trust client-provided prices
+    if (!product) {
+      throw new AppError(`Product "${item.itemId}" was not found in this store`, 422);
     }
 
-    const price     = product?.price ?? item.price;
+    // Stock checks
+    if (!product.inStock) {
+      throw new AppError(`"${product.name}" is currently out of stock`, 422);
+    }
+    if (product.stockCount !== -1 && product.stockCount < item.quantity) {
+      throw new AppError(
+        `Only ${product.stockCount} unit(s) of "${product.name}" available`,
+        422
+      );
+    }
+
+    // Use server price — client-provided price is ignored entirely
+    const price     = product.price;
     const itemTotal = price * item.quantity;
     subtotal       += itemTotal;
 
     processedItems.push({
       itemId:     item.itemId,
       itemSource: ItemSource.CATALOG_SERVICE,
-      name:       product?.name ?? item.name,
+      name:       product.name,
       price,
       quantity:   item.quantity,
-      addOns:     [],            // catalog products don't have add-ons
+      addOns:     [],
       specialInstructions: item.specialInstructions,
       subtotal:   itemTotal,
     });
@@ -174,30 +181,9 @@ const validateCatalogItems = async (
   return { processedItems, subtotal };
 };
 
-/**
- * Fallback: build order items directly from client data when a service call fails.
- */
-const buildItemsFromClient = (
-  items: any[],
-  source: ItemSource
-): { processedItems: IOrderItem[]; subtotal: number } => {
-  let subtotal = 0;
-  const processedItems: IOrderItem[] = items.map((item: any) => {
-    const itemTotal = item.price * item.quantity;
-    subtotal += itemTotal;
-    return {
-      itemId:     item.itemId,
-      itemSource: source,
-      name:       item.name,
-      price:      item.price,
-      quantity:   item.quantity,
-      addOns:     item.addOns ?? [],
-      specialInstructions: item.specialInstructions,
-      subtotal:   itemTotal,
-    };
-  });
-  return { processedItems, subtotal };
-};
+// buildItemsFromClient has been intentionally removed.
+// The order service ALWAYS fetches authoritative prices from the downstream
+// service. Client-provided prices are ignored to prevent manipulation.
 
 /**
  * After a catalog order is placed, tell catalog-service to decrement stock

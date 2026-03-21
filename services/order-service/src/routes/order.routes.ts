@@ -150,9 +150,8 @@ router.post(
     body('storeId').notEmpty().withMessage('storeId is required'),
     body('items').isArray({ min: 1 }).withMessage('items must be a non-empty array'),
     body('items.*.itemId').notEmpty().withMessage('Each item must have an itemId'),
-    body('items.*.name').notEmpty().withMessage('Each item must have a name'),
-    body('items.*.price').isFloat({ min: 0 }).withMessage('Each item must have a valid price'),
     body('items.*.quantity').isInt({ min: 1 }).withMessage('Each item must have a quantity ≥ 1'),
+    // name and price are NOT accepted from the client — fetched server-side from catalog/restaurant service
     body('deliveryType')
       .isIn(Object.values(DeliveryType))
       .withMessage(`deliveryType must be one of: ${Object.values(DeliveryType).join(', ')}`),
