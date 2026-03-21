@@ -1,62 +1,295 @@
-
 import { Response } from 'express';
 import axios from 'axios';
-import mongoose from 'mongoose';
-import { Order, OrderStatus, PaymentStatus, DeliveryType } from '../models/order.model';
+import {
+  Order,
+  OrderStatus,
+  PaymentStatus,
+  DeliveryType,
+  ItemSource,
+  StoreType,
+  IOrderItem,
+} from '../models/order.model';
 import { AppError, ErrorMiddleware } from '../middleware/error.middleware';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { config } from '../config';
 
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Maps a store-service category slug to the microservice that owns its items.
+ * Food → restaurant-service (menu items with variants + add-ons)
+ * Everything else → catalog-service (products with SKU + stock)
+ */
+const resolveItemSource = (storeType: string): ItemSource =>
+  storeType === StoreType.FOOD
+    ? ItemSource.RESTAURANT_SERVICE
+    : ItemSource.CATALOG_SERVICE;
+
+/**
+ * Fetch and validate the store from store-service.
+ * Returns the full store document including category slug and delivery info.
+ */
+const fetchStore = async (storeId: string) => {
+  const res = await axios
+    .get(`${config.storeServiceUrl}/api/stores/${storeId}`)
+    .catch(() => null);
+
+  if (!res?.data?.success || !res.data.data) {
+    throw new AppError('Store not found or unavailable', 404);
+  }
+
+  const store = res.data.data;
+
+  if (store.status !== 'active') {
+    throw new AppError('This store is not currently accepting orders', 422);
+  }
+
+  return store;
+};
+
+/**
+ * Validate items against restaurant-service (food orders).
+ * Returns enriched items with server-confirmed prices.
+ */
+const validateFoodItems = async (
+  restaurantId: string,
+  items: any[]
+): Promise<{ processedItems: IOrderItem[]; subtotal: number }> => {
+  // Fetch the restaurant's menu from restaurant-service
+  const menuRes = await axios
+    .get(`${config.restaurantServiceUrl}/api/restaurants/${restaurantId}/menu`)
+    .catch(() => null);
+
+  // If restaurant-service is unavailable, trust client prices but flag it
+  // In production you would always require server-side validation
+  if (!menuRes?.data?.success) {
+    console.warn(
+      `[order-service] Could not validate menu items against restaurant-service for restaurantId=${restaurantId}. Trusting client prices.`
+    );
+    return buildItemsFromClient(items, ItemSource.RESTAURANT_SERVICE);
+  }
+
+  const menuItems: Record<string, any> = {};
+  for (const item of menuRes.data.data ?? []) menuItems[item._id] = item;
+
+  let subtotal = 0;
+  const processedItems: IOrderItem[] = items.map((item: any) => {
+    const menuItem = menuItems[item.itemId];
+
+    // Fall back to client price if item not found in menu response
+    const basePrice = menuItem?.price ?? item.price;
+
+    let itemTotal = basePrice * item.quantity;
+
+    if (item.variant && menuItem) {
+      const variant = menuItem.variants?.find((v: any) => v.name === item.variant.name);
+      itemTotal += (variant?.price ?? item.variant.price) * item.quantity;
+    }
+
+    if (item.addOns?.length) {
+      itemTotal += item.addOns.reduce(
+        (sum: number, addon: any) => sum + (addon.price ?? 0),
+        0
+      ) * item.quantity;
+    }
+
+    subtotal += itemTotal;
+
+    return {
+      itemId:     item.itemId,
+      itemSource: ItemSource.RESTAURANT_SERVICE,
+      name:       menuItem?.name ?? item.name,
+      price:      basePrice,
+      quantity:   item.quantity,
+      variant:    item.variant,
+      addOns:     item.addOns ?? [],
+      specialInstructions: item.specialInstructions,
+      subtotal:   itemTotal,
+    };
+  });
+
+  return { processedItems, subtotal };
+};
+
+/**
+ * Validate items against catalog-service (grocery / pharmacy / shops).
+ * Checks stock availability and uses server-confirmed prices.
+ */
+const validateCatalogItems = async (
+  storeId: string,
+  items: any[]
+): Promise<{ processedItems: IOrderItem[]; subtotal: number }> => {
+  // Fetch all products for this store in one call
+  const productsRes = await axios
+    .get(`${config.catalogServiceUrl}/api/catalog/products`, {
+      params: { storeId, limit: 200 },
+    })
+    .catch(() => null);
+
+  if (!productsRes?.data?.success) {
+    console.warn(
+      `[order-service] Could not validate products against catalog-service for storeId=${storeId}. Trusting client prices.`
+    );
+    return buildItemsFromClient(items, ItemSource.CATALOG_SERVICE);
+  }
+
+  const productMap: Record<string, any> = {};
+  for (const p of productsRes.data.data ?? []) productMap[p._id] = p;
+
+  let subtotal = 0;
+  const processedItems: IOrderItem[] = [];
+
+  for (const item of items) {
+    const product = productMap[item.itemId];
+
+    if (product) {
+      // Stock check
+      if (!product.inStock) {
+        throw new AppError(`"${product.name}" is currently out of stock`, 422);
+      }
+      if (product.stockCount !== -1 && product.stockCount < item.quantity) {
+        throw new AppError(
+          `Only ${product.stockCount} unit(s) of "${product.name}" available`,
+          422
+        );
+      }
+    }
+
+    const price     = product?.price ?? item.price;
+    const itemTotal = price * item.quantity;
+    subtotal       += itemTotal;
+
+    processedItems.push({
+      itemId:     item.itemId,
+      itemSource: ItemSource.CATALOG_SERVICE,
+      name:       product?.name ?? item.name,
+      price,
+      quantity:   item.quantity,
+      addOns:     [],            // catalog products don't have add-ons
+      specialInstructions: item.specialInstructions,
+      subtotal:   itemTotal,
+    });
+  }
+
+  return { processedItems, subtotal };
+};
+
+/**
+ * Fallback: build order items directly from client data when a service call fails.
+ */
+const buildItemsFromClient = (
+  items: any[],
+  source: ItemSource
+): { processedItems: IOrderItem[]; subtotal: number } => {
+  let subtotal = 0;
+  const processedItems: IOrderItem[] = items.map((item: any) => {
+    const itemTotal = item.price * item.quantity;
+    subtotal += itemTotal;
+    return {
+      itemId:     item.itemId,
+      itemSource: source,
+      name:       item.name,
+      price:      item.price,
+      quantity:   item.quantity,
+      addOns:     item.addOns ?? [],
+      specialInstructions: item.specialInstructions,
+      subtotal:   itemTotal,
+    };
+  });
+  return { processedItems, subtotal };
+};
+
+/**
+ * After a catalog order is placed, tell catalog-service to decrement stock
+ * and increment totalOrders on each product.
+ * Fire-and-forget — a failure here does not roll back the order.
+ */
+const notifyCatalogService = (storeId: string, items: IOrderItem[]) => {
+  const payload = {
+    items: items.map(i => ({ productId: i.itemId, quantity: i.quantity })),
+  };
+  axios
+    .patch(
+      `${config.catalogServiceUrl}/api/catalog/products/internal/order-update`,
+      payload,
+      { headers: { 'x-internal-service': 'order-service' } }
+    )
+    .catch(err =>
+      console.error('[order-service] catalog order-update notification failed:', err.message)
+    );
+};
+
+// ─── Controller ───────────────────────────────────────────────────────────────
+
 export class OrderController {
 
-  // ─────────────────────────────────────────────
-  // Customer — Create Order
-  // ─────────────────────────────────────────────
+  // ── Customer: Create Order ──────────────────────────────────────────────────
 
   static createOrder = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
     const customerId = req.user!.id;
-    const { restaurantId, items, deliveryType, deliveryAddress, paymentMethod, customerNotes } = req.body;
+    const {
+      storeId,
+      items,
+      deliveryType,
+      deliveryAddress,
+      paymentMethod,
+      customerNotes,
+    } = req.body;
 
-    const restaurantResponse = await axios
-      .get(`${config.restaurantServiceUrl}/api/restaurants/${restaurantId}`)
-      .catch(() => null);
+    // ── Step 1: Validate the store via store-service ──────────────────────────
+    const store     = await fetchStore(storeId);
+    const storeType = store.category?.slug as StoreType;
+    const storeName = store.name as string;
 
-    if (!restaurantResponse?.data.success) {
-      throw new AppError('Restaurant not found', 404);
+    // ── Step 2: Validate items from the correct downstream service ────────────
+    const itemSource = resolveItemSource(storeType);
+
+    let processedItems: IOrderItem[];
+    let subtotal: number;
+
+    if (itemSource === ItemSource.RESTAURANT_SERVICE) {
+      // Food orders: validate menu items against restaurant-service
+      // store-service stores map 1:1 to restaurants; use storeId as restaurantId
+      ({ processedItems, subtotal } = await validateFoodItems(storeId, items));
+    } else {
+      // Non-food orders: validate products against catalog-service
+      ({ processedItems, subtotal } = await validateCatalogItems(storeId, items));
     }
 
-    const restaurant = restaurantResponse.data.data.restaurant;
+    // ── Step 3: Pricing ───────────────────────────────────────────────────────
+    const deliveryFee =
+      deliveryType === DeliveryType.PICKUP ? 0 : (store.deliveryFee ?? 0);
 
-    let subtotal = 0;
-    const processedItems = items.map((item: any) => {
-      let itemTotal = item.price * item.quantity;
-      if (item.variant) itemTotal += item.variant.price * item.quantity;
-      if (item.addOns?.length) {
-        itemTotal += item.addOns.reduce((sum: number, addon: any) => sum + addon.price, 0) * item.quantity;
+    // Minimum order check (skip for pickup)
+    if (deliveryType === DeliveryType.DELIVERY) {
+      const minimumOrder = store.minimumOrder ?? 0;
+      if (subtotal < minimumOrder) {
+        throw new AppError(
+          `Minimum order for this store is ₦${minimumOrder.toLocaleString()}`,
+          400
+        );
       }
-      subtotal += itemTotal;
-      return { ...item, subtotal: itemTotal };
-    });
-
-    const deliveryFee = deliveryType === DeliveryType.DELIVERY
-      ? restaurant.deliveryInfo.deliveryFee
-      : 0;
-
-    const tax = subtotal * config.taxRate;
-    const total = subtotal + deliveryFee + tax;
-
-    if (deliveryType === DeliveryType.DELIVERY && subtotal < restaurant.deliveryInfo.minimumOrder) {
-      throw new AppError(`Minimum order amount is $${restaurant.deliveryInfo.minimumOrder}`, 400);
     }
 
+    const tax        = Math.round(subtotal * config.taxRate);
+    const total      = subtotal + deliveryFee + tax;
+
+    // Delivery address is required for delivery orders
+    if (deliveryType === DeliveryType.DELIVERY && !deliveryAddress?.street) {
+      throw new AppError('A delivery address is required for delivery orders', 400);
+    }
+
+    // ── Step 4: Persist the order ─────────────────────────────────────────────
     const estimatedDeliveryTime = new Date();
     estimatedDeliveryTime.setMinutes(
-      estimatedDeliveryTime.getMinutes() + restaurant.deliveryInfo.estimatedDeliveryTime
+      estimatedDeliveryTime.getMinutes() + (store.preparationTime ?? 30) + 15
     );
 
     const order = await Order.create({
       customerId,
-      restaurantId,
+      storeId,
+      storeType,
+      storeName,
       items: processedItems,
       subtotal,
       deliveryFee,
@@ -67,76 +300,88 @@ export class OrderController {
       paymentMethod,
       customerNotes,
       estimatedDeliveryTime,
-      paymentStatus: paymentMethod === 'cash' ? PaymentStatus.PENDING : PaymentStatus.PAID,
+      paymentStatus:
+        paymentMethod === 'cash' ? PaymentStatus.PENDING : PaymentStatus.PAID,
     });
+
+    // ── Step 5: Side-effects ──────────────────────────────────────────────────
+    // Notify catalog-service to decrement stock (fire-and-forget)
+    if (itemSource === ItemSource.CATALOG_SERVICE) {
+      notifyCatalogService(storeId, processedItems);
+    }
 
     res.status(201).json({
       success: true,
-      message: 'Order created successfully',
-      data: { order },
+      message: 'Order placed successfully',
+      data:    { order },
     });
   });
 
-  // ─────────────────────────────────────────────
-  // Customer — Own Orders
-  // ─────────────────────────────────────────────
+  // ── Customer: Own Orders ────────────────────────────────────────────────────
 
   static getCustomerOrders = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
     const customerId = req.user!.id;
-    const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 10;
-    const skip = (page - 1) * limit;
+    const page  = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(50, parseInt(req.query.limit as string) || 10);
+    const skip  = (page - 1) * limit;
 
-    const query: any = { customerId };
-    if (req.query.status) query.status = req.query.status;
+    const query: Record<string, unknown> = { customerId };
+    if (req.query.status)    query.status    = req.query.status;
+    if (req.query.storeType) query.storeType = req.query.storeType;
 
     const [orders, total] = await Promise.all([
-      Order.find(query).skip(skip).limit(limit).sort({ createdAt: -1 }),
+      Order.find(query).skip(skip).limit(limit).sort({ createdAt: -1 }).lean(),
       Order.countDocuments(query),
     ]);
 
     res.status(200).json({
       success: true,
-      data: { orders, pagination: { page, limit, total, pages: Math.ceil(total / limit) } },
+      data: {
+        orders,
+        pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+      },
     });
   });
 
-  // ─────────────────────────────────────────────
-  // Restaurant — Own Restaurant Orders
-  // ─────────────────────────────────────────────
+  // ── Store Owner: Orders for their store ────────────────────────────────────
+  // Route: GET /api/orders/store/:storeId
 
-  static getRestaurantOrders = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { restaurantId } = req.params;
-    const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 10;
-    const skip = (page - 1) * limit;
+  static getStoreOrders = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
+    const { storeId } = req.params;
+    const page  = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(100, parseInt(req.query.limit as string) || 10);
+    const skip  = (page - 1) * limit;
 
-    const query: any = { restaurantId };
+    const query: Record<string, unknown> = { storeId };
     if (req.query.status) query.status = req.query.status;
 
     const [orders, total] = await Promise.all([
-      Order.find(query).skip(skip).limit(limit).sort({ createdAt: -1 }),
+      Order.find(query).skip(skip).limit(limit).sort({ createdAt: -1 }).lean(),
       Order.countDocuments(query),
     ]);
 
     res.status(200).json({
       success: true,
-      data: { orders, pagination: { page, limit, total, pages: Math.ceil(total / limit) } },
+      data: {
+        orders,
+        pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+      },
     });
   });
 
-  // Per-restaurant stats (used by restaurant owner dashboard too)
-  static getOrderStats = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { restaurantId } = req.params;
+  // ── Store Owner: Stats ─────────────────────────────────────────────────────
+
+  static getStoreOrderStats = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
+    const { storeId } = req.params;
 
     const [statusBreakdown, totalOrders, revenueResult] = await Promise.all([
       Order.aggregate([
-        { $match: { restaurantId } },
+        { $match: { storeId } },
         { $group: { _id: '$status', count: { $sum: 1 }, totalRevenue: { $sum: '$total' } } },
       ]),
-      Order.countDocuments({ restaurantId }),
+      Order.countDocuments({ storeId }),
       Order.aggregate([
-        { $match: { restaurantId, status: OrderStatus.DELIVERED } },
+        { $match: { storeId, status: OrderStatus.DELIVERED } },
         { $group: { _id: null, total: { $sum: '$total' } } },
       ]),
     ]);
@@ -145,44 +390,42 @@ export class OrderController {
       success: true,
       data: {
         totalOrders,
-        totalRevenue: revenueResult[0]?.total || 0,
+        totalRevenue:   revenueResult[0]?.total ?? 0,
         statusBreakdown,
       },
     });
   });
 
-  // ─────────────────────────────────────────────
-  // Shared — Order Lifecycle (restaurant + admin)
-  // ─────────────────────────────────────────────
+  // ── Shared: Single Order ───────────────────────────────────────────────────
 
   static getOrderById = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
-    const order = await Order.findById(req.params.id);
+    const order = await Order.findById(req.params.id).lean();
     if (!order) throw new AppError('Order not found', 404);
 
-    const isAdmin = req.user?.role === 'admin';
-    const isCustomer = order.customerId.toString() === req.user?.id;
-    const isDriver = order.driverId?.toString() === req.user?.id;
-    // Restaurant ownership check would require a service call; allow if any of the above or admin
+    // Access control: only the customer, their driver, or an admin may view
+    const isAdmin    = req.user?.role === 'admin';
+    const isCustomer = order.customerId === req.user?.id;
+    const isDriver   = order.driverId   === req.user?.id;
+
     if (!isAdmin && !isCustomer && !isDriver) {
-      // Allow restaurant owners through too — they pass restaurantId check on their own route
-      // For direct lookup, trust the auth layer to scope access on the frontend
-      // (or add a service call here if strict enforcement is needed)
+      throw new AppError('You are not authorised to view this order', 403);
     }
 
     res.status(200).json({ success: true, data: { order } });
   });
 
+  // ── Shared: Update Order Status ────────────────────────────────────────────
+
   static updateOrderStatus = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { id } = req.params;
-    const { status, restaurantNotes } = req.body;
+    const { id }                       = req.params;
+    const { status, restaurantNotes }  = req.body;
 
     const order = await Order.findById(id);
     if (!order) throw new AppError('Order not found', 404);
 
     const isAdmin = req.user?.role === 'admin';
 
-    // Non-admins cannot push an order back to a previous status
-    const statusFlow = [
+    const STATUS_FLOW = [
       OrderStatus.PENDING,
       OrderStatus.CONFIRMED,
       OrderStatus.PREPARING,
@@ -191,163 +434,175 @@ export class OrderController {
       OrderStatus.DELIVERED,
     ];
 
-    const currentIndex = statusFlow.indexOf(order.status as OrderStatus);
-    const newIndex = statusFlow.indexOf(status);
+    const currentIdx = STATUS_FLOW.indexOf(order.status as OrderStatus);
+    const newIdx     = STATUS_FLOW.indexOf(status);
 
-    if (!isAdmin && newIndex < currentIndex && status !== OrderStatus.CANCELLED) {
+    if (!isAdmin && newIdx < currentIdx && status !== OrderStatus.CANCELLED) {
       throw new AppError('Cannot move order back to a previous status', 400);
     }
 
     order.status = status;
     if (restaurantNotes) order.restaurantNotes = restaurantNotes;
 
+    const now = new Date();
     switch (status) {
-      case OrderStatus.CONFIRMED:      order.confirmedAt = new Date();       break;
-      case OrderStatus.PREPARING:      order.preparingAt = new Date();       break;
-      case OrderStatus.READY:          order.readyAt = new Date();           break;
-      case OrderStatus.OUT_FOR_DELIVERY: order.outForDeliveryAt = new Date(); break;
-      case OrderStatus.DELIVERED:      order.deliveredAt = new Date();       break;
-      case OrderStatus.CANCELLED:      order.cancelledAt = new Date();       break;
+      case OrderStatus.CONFIRMED:        order.confirmedAt      = now; break;
+      case OrderStatus.PREPARING:        order.preparingAt      = now; break;
+      case OrderStatus.READY:            order.readyAt          = now; break;
+      case OrderStatus.OUT_FOR_DELIVERY: order.outForDeliveryAt = now; break;
+      case OrderStatus.DELIVERED:        order.deliveredAt      = now; break;
+      case OrderStatus.CANCELLED:        order.cancelledAt      = now; break;
     }
 
     await order.save();
 
-    res.status(200).json({ success: true, message: 'Order status updated', data: { order } });
+    res.status(200).json({
+      success: true,
+      message: `Order status updated to "${status}"`,
+      data:    { order },
+    });
   });
 
+  // ── Shared: Assign Driver ──────────────────────────────────────────────────
+
   static assignDriver = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { id } = req.params;
+    const { id }       = req.params;
     const { driverId } = req.body;
 
     const order = await Order.findById(id);
     if (!order) throw new AppError('Order not found', 404);
 
     order.driverId = driverId;
+
     if (order.status === OrderStatus.READY) {
-      order.status = OrderStatus.OUT_FOR_DELIVERY;
+      order.status           = OrderStatus.OUT_FOR_DELIVERY;
       order.outForDeliveryAt = new Date();
     }
 
     await order.save();
 
-    res.status(200).json({ success: true, message: 'Driver assigned successfully', data: { order } });
+    res.status(200).json({
+      success: true,
+      message: 'Driver assigned successfully',
+      data:    { order },
+    });
   });
 
+  // ── Customer / Admin: Cancel Order ─────────────────────────────────────────
+
   static cancelOrder = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { id } = req.params;
+    const { id }     = req.params;
     const { reason } = req.body;
 
     const order = await Order.findById(id);
     if (!order) throw new AppError('Order not found', 404);
 
     const isAdmin = req.user?.role === 'admin';
-    const isOwner = order.customerId.toString() === req.user?.id;
+    const isOwner = order.customerId === req.user?.id;
 
     if (!isAdmin && !isOwner) {
-      throw new AppError('Not authorized to cancel this order', 403);
+      throw new AppError('Not authorised to cancel this order', 403);
     }
 
     if (order.status === OrderStatus.DELIVERED) {
       throw new AppError('Cannot cancel a delivered order', 400);
     }
 
-    // Non-admins can only cancel while still pending or confirmed
-    if (!isAdmin && ![OrderStatus.PENDING, OrderStatus.CONFIRMED].includes(order.status as OrderStatus)) {
-      throw new AppError('Order cannot be cancelled at this stage. Please contact support.', 400);
+    const cancellableStatuses = [OrderStatus.PENDING, OrderStatus.CONFIRMED];
+    if (!isAdmin && !cancellableStatuses.includes(order.status as OrderStatus)) {
+      throw new AppError(
+        'Order cannot be cancelled at this stage. Please contact support.',
+        400
+      );
     }
 
-    order.status = OrderStatus.CANCELLED;
-    order.cancelledAt = new Date();
+    order.status             = OrderStatus.CANCELLED;
+    order.cancelledAt        = new Date();
     order.cancellationReason = reason;
 
     await order.save();
 
-    res.status(200).json({ success: true, message: 'Order cancelled successfully', data: { order } });
+    res.status(200).json({
+      success: true,
+      message: 'Order cancelled successfully',
+      data:    { order },
+    });
   });
 
-  // ─────────────────────────────────────────────
-  // Admin — Platform-wide Order Management
-  // ─────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+  // Admin Routes
+  // ══════════════════════════════════════════════════════════════════════════
 
-  /**
-   * GET /admin/orders
-   * Full order list — all customers, all restaurants, all statuses
-   * Supports rich filtering for the admin dashboard table
-   */
   static adminGetAllOrders = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
-    const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 20;
-    const skip = (page - 1) * limit;
+    const page  = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
+    const skip  = (page - 1) * limit;
 
     const {
-      status,
-      paymentStatus,
-      paymentMethod,
-      deliveryType,
-      customerId,
-      restaurantId,
-      driverId,
-      dateFrom,
-      dateTo,
-      minTotal,
-      maxTotal,
+      status, paymentStatus, paymentMethod, deliveryType,
+      customerId, storeId, storeType, driverId,
+      dateFrom, dateTo, minTotal, maxTotal,
     } = req.query;
 
-    const query: any = {};
-    if (status) query.status = status;
+    const query: Record<string, unknown> = {};
+    if (status)        query.status        = status;
     if (paymentStatus) query.paymentStatus = paymentStatus;
     if (paymentMethod) query.paymentMethod = paymentMethod;
-    if (deliveryType) query.deliveryType = deliveryType;
-    if (customerId) query.customerId = customerId;
-    if (restaurantId) query.restaurantId = restaurantId;
-    if (driverId) query.driverId = driverId;
+    if (deliveryType)  query.deliveryType  = deliveryType;
+    if (customerId)    query.customerId    = customerId;
+    if (storeId)       query.storeId       = storeId;
+    if (storeType)     query.storeType     = storeType;
+    if (driverId)      query.driverId      = driverId;
 
     if (dateFrom || dateTo) {
       query.createdAt = {};
-      if (dateFrom) query.createdAt.$gte = new Date(dateFrom as string);
-      if (dateTo) query.createdAt.$lte = new Date(dateTo as string);
+      if (dateFrom) (query.createdAt as any).$gte = new Date(dateFrom as string);
+      if (dateTo)   (query.createdAt as any).$lte = new Date(dateTo   as string);
     }
 
     if (minTotal || maxTotal) {
       query.total = {};
-      if (minTotal) query.total.$gte = parseFloat(minTotal as string);
-      if (maxTotal) query.total.$lte = parseFloat(maxTotal as string);
+      if (minTotal) (query.total as any).$gte = parseFloat(minTotal as string);
+      if (maxTotal) (query.total as any).$lte = parseFloat(maxTotal as string);
     }
 
     const [orders, total] = await Promise.all([
-      Order.find(query).skip(skip).limit(limit).sort({ createdAt: -1 }),
+      Order.find(query).skip(skip).limit(limit).sort({ createdAt: -1 }).lean(),
       Order.countDocuments(query),
     ]);
 
     res.status(200).json({
       success: true,
-      data: { orders, pagination: { page, limit, total, pages: Math.ceil(total / limit) } },
+      data: {
+        orders,
+        pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+      },
     });
   });
 
-  /**
-   * PATCH /admin/orders/:id/payment-status
-   * Update payment status — e.g. mark as refunded after a dispute
-   */
   static adminUpdatePaymentStatus = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { id } = req.params;
-    const { paymentStatus, reason } = req.body;
+    const { id }                       = req.params;
+    const { paymentStatus, reason }    = req.body;
 
-    const validStatuses = Object.values(PaymentStatus);
-    if (!validStatuses.includes(paymentStatus)) {
-      throw new AppError(`paymentStatus must be one of: ${validStatuses.join(', ')}`, 400);
+    if (!Object.values(PaymentStatus).includes(paymentStatus)) {
+      throw new AppError(
+        `paymentStatus must be one of: ${Object.values(PaymentStatus).join(', ')}`,
+        400
+      );
     }
 
     const order = await Order.findById(id);
     if (!order) throw new AppError('Order not found', 404);
 
-    const previousStatus = order.paymentStatus;
-    order.paymentStatus = paymentStatus;
+    const previousStatus   = order.paymentStatus;
+    order.paymentStatus    = paymentStatus;
 
-    // If marking as refunded, also cancel the order if it isn't delivered yet
-    if (paymentStatus === PaymentStatus.REFUNDED && order.status !== OrderStatus.DELIVERED) {
-      order.status = OrderStatus.CANCELLED;
-      order.cancelledAt = new Date();
+    if (
+      paymentStatus === PaymentStatus.REFUNDED &&
+      order.status  !== OrderStatus.DELIVERED
+    ) {
+      order.status             = OrderStatus.CANCELLED;
+      order.cancelledAt        = new Date();
       order.cancellationReason = reason || 'Refunded by admin';
     }
 
@@ -356,33 +611,33 @@ export class OrderController {
     res.status(200).json({
       success: true,
       message: `Payment status changed from '${previousStatus}' to '${paymentStatus}'`,
-      data: { order },
+      data:    { order },
     });
   });
 
-  /**
-   * PATCH /admin/orders/:id/force-cancel
-   * Cancel any order at any stage — even out-for-delivery ones
-   */
   static adminForceCancel = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { id } = req.params;
+    const { id }     = req.params;
     const { reason } = req.body;
 
-    if (!reason) throw new AppError('Cancellation reason is required for admin force-cancel', 400);
+    if (!reason) {
+      throw new AppError('Cancellation reason is required for admin force-cancel', 400);
+    }
 
     const order = await Order.findById(id);
     if (!order) throw new AppError('Order not found', 404);
 
     if (order.status === OrderStatus.DELIVERED) {
-      throw new AppError('Cannot cancel an already-delivered order. Use refund instead.', 400);
+      throw new AppError(
+        'Cannot cancel an already-delivered order. Use the refund flow instead.',
+        400
+      );
     }
-
     if (order.status === OrderStatus.CANCELLED) {
       throw new AppError('Order is already cancelled', 400);
     }
 
-    order.status = OrderStatus.CANCELLED;
-    order.cancelledAt = new Date();
+    order.status             = OrderStatus.CANCELLED;
+    order.cancelledAt        = new Date();
     order.cancellationReason = `[Admin] ${reason}`;
 
     await order.save();
@@ -390,28 +645,24 @@ export class OrderController {
     res.status(200).json({
       success: true,
       message: 'Order force-cancelled by admin',
-      data: { order },
+      data:    { order },
     });
   });
 
-  /**
-   * GET /admin/orders/stats
-   * Platform-wide revenue and order statistics for the admin dashboard
-   */
   static adminGetPlatformStats = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
     const { dateFrom, dateTo } = req.query;
 
-    const dateFilter: any = {};
+    const dateFilter: Record<string, Date> = {};
     if (dateFrom) dateFilter.$gte = new Date(dateFrom as string);
-    if (dateTo) dateFilter.$lte = new Date(dateTo as string);
+    if (dateTo)   dateFilter.$lte = new Date(dateTo   as string);
     const hasDateFilter = Object.keys(dateFilter).length > 0;
 
-    const baseMatch = hasDateFilter ? { createdAt: dateFilter } : {};
+    const baseMatch      = hasDateFilter ? { createdAt: dateFilter } : {};
     const deliveredMatch = { ...baseMatch, status: OrderStatus.DELIVERED };
 
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const todayStart = new Date();
+    const sevenDaysAgo  = new Date(Date.now() -  7 * 24 * 60 * 60 * 1000);
+    const todayStart    = new Date();
     todayStart.setHours(0, 0, 0, 0);
 
     const [
@@ -423,9 +674,10 @@ export class OrderController {
       byStatus,
       byPaymentMethod,
       byDeliveryType,
-      revenueByDay,           // last 30 days daily revenue
-      ordersByDay,            // last 30 days daily order count
-      topRestaurants,         // top 5 by revenue
+      byStoreType,         // NEW — breakdown per store category
+      revenueByDay,
+      ordersByDay,
+      topStores,           // renamed from topRestaurants
       ordersToday,
       ordersThisWeek,
       revenueToday,
@@ -435,76 +687,60 @@ export class OrderController {
       Order.countDocuments({ ...baseMatch, status: OrderStatus.CANCELLED }),
       Order.countDocuments({ ...baseMatch, status: OrderStatus.PENDING }),
 
-      // Total platform revenue (delivered orders only)
       Order.aggregate([
         { $match: deliveredMatch },
         { $group: { _id: null, revenue: { $sum: '$total' }, tax: { $sum: '$tax' }, deliveryFees: { $sum: '$deliveryFee' } } },
       ]),
 
-      // Breakdown by order status
       Order.aggregate([
         { $match: baseMatch },
         { $group: { _id: '$status', count: { $sum: 1 }, revenue: { $sum: '$total' } } },
         { $project: { _id: 0, status: '$_id', count: 1, revenue: 1 } },
       ]),
 
-      // Breakdown by payment method
       Order.aggregate([
         { $match: deliveredMatch },
         { $group: { _id: '$paymentMethod', count: { $sum: 1 }, revenue: { $sum: '$total' } } },
         { $project: { _id: 0, method: '$_id', count: 1, revenue: 1 } },
       ]),
 
-      // Delivery vs Pickup split
       Order.aggregate([
         { $match: baseMatch },
         { $group: { _id: '$deliveryType', count: { $sum: 1 } } },
         { $project: { _id: 0, type: '$_id', count: 1 } },
       ]),
 
-      // Daily revenue — last 30 days
+      // NEW — revenue + orders split by storeType (food vs groceries vs pharmacy etc.)
+      Order.aggregate([
+        { $match: deliveredMatch },
+        { $group: { _id: '$storeType', count: { $sum: 1 }, revenue: { $sum: '$total' } } },
+        { $project: { _id: 0, storeType: '$_id', count: 1, revenue: 1 } },
+        { $sort: { revenue: -1 } },
+      ]),
+
       Order.aggregate([
         { $match: { status: OrderStatus.DELIVERED, createdAt: { $gte: thirtyDaysAgo } } },
-        {
-          $group: {
-            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-            revenue: { $sum: '$total' },
-            orders: { $sum: 1 },
-          },
-        },
+        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, revenue: { $sum: '$total' }, orders: { $sum: 1 } } },
         { $sort: { _id: 1 } },
         { $project: { _id: 0, date: '$_id', revenue: 1, orders: 1 } },
       ]),
 
-      // Daily order count — last 30 days (all statuses)
       Order.aggregate([
         { $match: { createdAt: { $gte: thirtyDaysAgo } } },
-        {
-          $group: {
-            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-            count: { $sum: 1 },
-          },
-        },
+        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
         { $sort: { _id: 1 } },
         { $project: { _id: 0, date: '$_id', count: 1 } },
       ]),
 
-      // Top 5 restaurants by delivered revenue
+      // Top 5 stores by delivered revenue (works for all store types)
       Order.aggregate([
         { $match: deliveredMatch },
-        {
-          $group: {
-            _id: '$restaurantId',
-            totalRevenue: { $sum: '$total' },
-            totalOrders: { $sum: 1 },
-          },
-        },
+        { $group: { _id: '$storeId', storeName: { $first: '$storeName' }, storeType: { $first: '$storeType' }, totalRevenue: { $sum: '$total' }, totalOrders: { $sum: 1 } } },
         { $sort: { totalRevenue: -1 } },
         { $limit: 5 },
-        { $project: { _id: 0, restaurantId: '$_id', totalRevenue: 1, totalOrders: 1 } },
+        { $project: { _id: 0, storeId: '$_id', storeName: 1, storeType: 1, totalRevenue: 1, totalOrders: 1 } },
       ]),
 
-      // Quick counters for the top of the dashboard
       Order.countDocuments({ createdAt: { $gte: todayStart } }),
       Order.countDocuments({ createdAt: { $gte: sevenDaysAgo } }),
       Order.aggregate([
@@ -513,13 +749,12 @@ export class OrderController {
       ]),
     ]);
 
-    const revenue = totalRevenueResult[0] || { revenue: 0, tax: 0, deliveryFees: 0 };
+    const revenue = totalRevenueResult[0] ?? { revenue: 0, tax: 0, deliveryFees: 0 };
 
     res.status(200).json({
       success: true,
       data: {
         stats: {
-          // Headline numbers
           totalOrders,
           deliveredOrders,
           cancelledOrders,
@@ -528,73 +763,72 @@ export class OrderController {
             ? parseFloat(((deliveredOrders / totalOrders) * 100).toFixed(2))
             : 0,
 
-          // Revenue
-          totalRevenue: revenue.revenue,
-          totalTax: revenue.tax,
+          totalRevenue:     revenue.revenue,
+          totalTax:         revenue.tax,
           totalDeliveryFees: revenue.deliveryFees,
 
-          // Quick period stats
           ordersToday,
           ordersThisWeek,
-          revenueToday: revenueToday[0]?.revenue || 0,
+          revenueToday: revenueToday[0]?.revenue ?? 0,
 
-          // Breakdowns for charts
           byStatus,
           byPaymentMethod,
           byDeliveryType,
+          byStoreType,       // NEW
 
-          // Time-series for line charts (last 30 days)
           revenueByDay,
           ordersByDay,
 
-          // Leaderboard
-          topRestaurants,
+          topStores,         // renamed from topRestaurants
         },
       },
     });
   });
 
-  /**
-   * GET /admin/orders/stats/restaurants
-   * Per-restaurant revenue summary — useful for financial reporting
-   */
-  static adminGetRevenueByRestaurant = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
-    const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 20;
-    const skip = (page - 1) * limit;
+  static adminGetRevenueByStore = ErrorMiddleware.asyncHandler(async (req: AuthRequest, res: Response) => {
+    const page  = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
+    const skip  = (page - 1) * limit;
 
-    const { dateFrom, dateTo } = req.query;
-    const match: any = { status: OrderStatus.DELIVERED };
-    if (dateFrom) match.createdAt = { ...match.createdAt, $gte: new Date(dateFrom as string) };
-    if (dateTo) match.createdAt = { ...match.createdAt, $lte: new Date(dateTo as string) };
+    const { dateFrom, dateTo, storeType } = req.query;
 
-    const [result, total] = await Promise.all([
+    const match: Record<string, unknown> = { status: OrderStatus.DELIVERED };
+    if (storeType) match.storeType = storeType;
+    if (dateFrom || dateTo) {
+      match.createdAt = {};
+      if (dateFrom) (match.createdAt as any).$gte = new Date(dateFrom as string);
+      if (dateTo)   (match.createdAt as any).$lte = new Date(dateTo   as string);
+    }
+
+    const [result, countResult] = await Promise.all([
       Order.aggregate([
         { $match: match },
-        {
-          $group: {
-            _id: '$restaurantId',
-            totalRevenue: { $sum: '$total' },
-            totalOrders: { $sum: 1 },
+        { $group: {
+            _id:           '$storeId',
+            storeName:     { $first: '$storeName' },
+            storeType:     { $first: '$storeType' },
+            totalRevenue:  { $sum: '$total' },
+            totalOrders:   { $sum: 1 },
             avgOrderValue: { $avg: '$total' },
           },
         },
         { $sort: { totalRevenue: -1 } },
         { $skip: skip },
         { $limit: limit },
-        {
-          $project: {
+        { $project: {
             _id: 0,
-            restaurantId: '$_id',
-            totalRevenue: 1,
-            totalOrders: 1,
+            storeId:       '$_id',
+            storeName:     1,
+            storeType:     1,
+            totalRevenue:  1,
+            totalOrders:   1,
             avgOrderValue: { $round: ['$avgOrderValue', 2] },
           },
         },
       ]),
       Order.aggregate([
         { $match: match },
-        { $group: { _id: '$restaurantId' } },
+        { $group: { _id: '$storeId' } },
         { $count: 'total' },
       ]),
     ]);
@@ -602,12 +836,12 @@ export class OrderController {
     res.status(200).json({
       success: true,
       data: {
-        restaurants: result,
+        stores: result,
         pagination: {
           page,
           limit,
-          total: total[0]?.total || 0,
-          pages: Math.ceil((total[0]?.total || 0) / limit),
+          total: countResult[0]?.total ?? 0,
+          pages: Math.ceil((countResult[0]?.total ?? 0) / limit),
         },
       },
     });
