@@ -1,3 +1,4 @@
+
 // import { Response } from 'express';
 // import axios from 'axios';
 // import {
@@ -30,18 +31,49 @@
 //  * Returns the full store document including category slug and delivery info.
 //  */
 // const fetchStore = async (storeId: string) => {
-//   const res = await axios
-//     .get(`${config.storeServiceUrl}/api/stores/${storeId}`)
-//     .catch(() => null);
+//   let res: any = null;
+
+//   try {
+//     res = await axios.get(`${config.storeServiceUrl}/api/stores/${storeId}`);
+//   } catch (err: any) {
+//     // Log the real error so it's visible in service logs
+//     console.error(
+//       `[order-service] fetchStore failed for storeId=${storeId}:`,
+//       err?.response?.status,
+//       err?.response?.data ?? err?.message
+//     );
+
+//     // 404 from store-service = genuinely not found
+//     if (err?.response?.status === 404) {
+//       throw new AppError('Store not found', 404);
+//     }
+
+//     // Any other error = store-service is unreachable
+//     throw new AppError(
+//       `Could not reach store service (${err?.response?.status ?? err?.message}). Please try again.`,
+//       503
+//     );
+//   }
 
 //   if (!res?.data?.success || !res.data.data) {
+//     console.error(
+//       `[order-service] Unexpected store-service response for storeId=${storeId}:`,
+//       res?.data
+//     );
 //     throw new AppError('Store not found or unavailable', 404);
 //   }
 
 //   const store = res.data.data;
 
+//   console.log(
+//     `[order-service] fetchStore resolved: storeId=${storeId} name="${store.name}" status="${store.status}" category="${store.category?.slug}"`
+//   );
+
 //   if (store.status !== 'active') {
-//     throw new AppError('This store is not currently accepting orders', 422);
+//     throw new AppError(
+//       `This store is currently "${store.status}" and not accepting orders`,
+//       422
+//     );
 //   }
 
 //   return store;
@@ -834,6 +866,8 @@
 //   });
 // }
 
+
+
 import { Response } from 'express';
 import axios from 'axios';
 import {
@@ -850,6 +884,48 @@ import { AuthRequest } from '../middleware/auth.middleware';
 import { config } from '../config';
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Retry an axios GET with exponential backoff.
+ * Retries on 502, 503, 504 (transient Render cold-start / gateway errors).
+ * Throws the last error if all attempts fail.
+ */
+const axiosGetWithRetry = async (
+  url: string,
+  opts: { timeoutMs?: number; maxAttempts?: number; params?: Record<string, any> } = {}
+): Promise<any> => {
+  const { timeoutMs = 8000, maxAttempts = 3, params } = opts;
+  const RETRYABLE = new Set([502, 503, 504]);
+
+  let lastErr: any;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await axios.get(url, {
+        timeout: timeoutMs,
+        params,
+      });
+      return res;
+    } catch (err: any) {
+      lastErr = err;
+      const status: number | undefined = err?.response?.status;
+
+      const isRetryable =
+        !status ||                          // network-level error (ECONNREFUSED, ETIMEDOUT)
+        RETRYABLE.has(status);              // 502/503/504 = cold start / gateway bounce
+
+      if (!isRetryable || attempt === maxAttempts) break;
+
+      const delay = 1000 * attempt;        // 1 s, 2 s, 3 s …
+      console.warn(
+        `[order-service] Attempt ${attempt}/${maxAttempts} failed (${status ?? err.code}) for ${url}. Retrying in ${delay}ms…`
+      );
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+
+  throw lastErr;
+};
 
 /**
  * Maps a store-service category slug to the microservice that owns its items.
@@ -869,23 +945,24 @@ const fetchStore = async (storeId: string) => {
   let res: any = null;
 
   try {
-    res = await axios.get(`${config.storeServiceUrl}/api/stores/${storeId}`);
+    // Up to 3 attempts with 8 s timeout each — handles Render cold-start 502s
+    res = await axiosGetWithRetry(
+      `${config.storeServiceUrl}/api/stores/${storeId}`,
+      { timeoutMs: 8000, maxAttempts: 3 }
+    );
   } catch (err: any) {
-    // Log the real error so it's visible in service logs
+    const status: number | undefined = err?.response?.status;
+
     console.error(
-      `[order-service] fetchStore failed for storeId=${storeId}:`,
-      err?.response?.status,
+      `[order-service] fetchStore permanently failed for storeId=${storeId}:`,
+      status,
       err?.response?.data ?? err?.message
     );
 
-    // 404 from store-service = genuinely not found
-    if (err?.response?.status === 404) {
-      throw new AppError('Store not found', 404);
-    }
+    if (status === 404) throw new AppError('Store not found', 404);
 
-    // Any other error = store-service is unreachable
     throw new AppError(
-      `Could not reach store service (${err?.response?.status ?? err?.message}). Please try again.`,
+      `Store service is temporarily unavailable (${status ?? err?.code ?? err?.message}). Please try again in a moment.`,
       503
     );
   }
@@ -990,21 +1067,42 @@ const validateCatalogItems = async (
   items: any[]
 ): Promise<{ processedItems: IOrderItem[]; subtotal: number }> => {
   // Fetch all products for this store in one call
-  const productsRes = await axios
-    .get(`${config.catalogServiceUrl}/api/catalog/products`, {
-      params: { storeId, limit: 200 },
-    })
-    .catch(() => null);
-
-  if (!productsRes?.data?.success) {
+  let productsRes: any = null;
+  try {
+    // Correct endpoint: /api/catalog/products/store/:storeId
+    // returns products grouped by category — flat list in data.data[]
+    productsRes = await axiosGetWithRetry(
+      `${config.catalogServiceUrl}/api/catalog/products/store/${storeId}`,
+      { timeoutMs: 8000, maxAttempts: 3 }
+    );
+  } catch (err: any) {
+    console.error(
+      `[order-service] catalog products fetch failed for storeId=${storeId}:`,
+      err?.response?.status ?? err?.message
+    );
     throw new AppError(
-      'Could not reach catalog service to validate products. Please try again.',
+      `Catalog service is temporarily unavailable. Please try again in a moment.`,
       503
     );
   }
 
+  if (!productsRes?.data?.success) {
+    throw new AppError(
+      'Could not validate products. Please try again.',
+      503
+    );
+  }
+
+  // /products/store/:storeId returns grouped data:
+  // { data: [ { category: {...}, products: [...] }, ... ] }
+  // Flatten all groups into a single productId → product map
   const productMap: Record<string, any> = {};
-  for (const p of productsRes.data.data ?? []) productMap[p._id] = p;
+  const groups: any[] = productsRes.data.data ?? [];
+  for (const group of groups) {
+    for (const p of group.products ?? []) {
+      productMap[p._id] = p;
+    }
+  }
 
   let subtotal = 0;
   const processedItems: IOrderItem[] = [];
